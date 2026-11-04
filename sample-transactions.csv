@@ -1,0 +1,4 @@
+title,amount,transaction_type,category,transaction_date,payment_method
+Salary,60600,income,Salary,2026-11-01,bank_transfer
+Groceries,1250,expense,Food & Groceries,2026-11-02,upi
+Petrol,900,expense,Transport / Petrol,2026-11-02,upi
