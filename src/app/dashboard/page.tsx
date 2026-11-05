@@ -1,7 +1,7 @@
-
-"use client";
+ "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import type { FormEvent, ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import {
   Wallet,
@@ -13,7 +13,7 @@ import {
   Upload,
   Trash2,
   Pencil,
-  ChartNoAxesCombined
+  ChartNoAxesCombined,
 } from "lucide-react";
 import { getSupabase } from "@/lib/supabase";
 import { money, dateLabel } from "@/lib/format";
@@ -25,14 +25,16 @@ import {
   ResponsiveContainer,
   Tooltip,
   XAxis,
-  YAxis
+  YAxis,
 } from "recharts";
+
+type TransactionType = "income" | "expense";
 
 type Tx = {
   id: string;
   title: string;
   amount: number;
-  transaction_type: "income" | "expense";
+  transaction_type: TransactionType;
   transaction_date: string;
   payment_method: string;
   notes: string | null;
@@ -43,395 +45,577 @@ type Tx = {
 type Category = {
   id: string;
   name: string;
-  type: string;
+  type: TransactionType;
 };
 
-type ImportedTransaction = {
+type TransactionInsert = {
   title: string;
   amount: number;
-  transaction_type: "income" | "expense";
+  transaction_type: TransactionType;
   category_id: string;
   transaction_date: string;
   payment_method: string;
-  notes: string;
+  notes: string | null;
   user_id: string;
   currency: string;
   status: string;
 };
 
-const initialForm = {
+type TransactionForm = {
+  title: string;
+  amount: string;
+  transaction_type: TransactionType;
+  category_id: string;
+  transaction_date: string;
+  payment_method: string;
+  notes: string;
+};
+
+const PAYMENT_METHODS = [
+  "upi",
+  "cash",
+  "debit_card",
+  "credit_card",
+  "bank_transfer",
+  "net_banking",
+  "other",
+] as const;
+
+function localDateString(date = new Date()): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function localMonthString(date = new Date()): string {
+  return localDateString(date).slice(0, 7);
+}
+
+function getMonthRange(month: string): { start: string; end: string } {
+  const [yearPart, monthPart] = month.split("-");
+  const year = Number(yearPart);
+  const monthNumber = Number(monthPart);
+
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(monthNumber) ||
+    monthNumber < 1 ||
+    monthNumber > 12
+  ) {
+    const fallback = localMonthString();
+    return getMonthRange(fallback);
+  }
+
+  const nextMonth = monthNumber === 12 ? 1 : monthNumber + 1;
+  const nextYear = monthNumber === 12 ? year + 1 : year;
+
+  return {
+    start: `${year}-${String(monthNumber).padStart(2, "0")}-01`,
+    end: `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`,
+  };
+}
+
+/**
+ * Parses standard CSV including quoted commas, escaped quotes and newlines.
+ * Throws when a quoted field is not closed.
+ */
+function parseCsv(input: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < input.length; i += 1) {
+    const char = input[i];
+    const next = input[i + 1];
+
+    if (inQuotes) {
+      if (char === '"' && next === '"') {
+        field += '"';
+        i += 1;
+      } else if (char === '"') {
+        inQuotes = false;
+      } else {
+        field += char;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      if (field.length > 0) {
+        throw new Error("Invalid CSV: a quote appeared in the middle of a field.");
+      }
+      inQuotes = true;
+    } else if (char === ",") {
+      row.push(field.trim());
+      field = "";
+    } else if (char === "\n") {
+      row.push(field.trim());
+      if (row.some((value) => value.length > 0)) rows.push(row);
+      row = [];
+      field = "";
+    } else if (char === "\r") {
+      // Ignore CR; the following LF ends the record.
+    } else {
+      field += char;
+    }
+  }
+
+  if (inQuotes) {
+    throw new Error("Invalid CSV: a quoted field was not closed.");
+  }
+
+  row.push(field.trim());
+  if (row.some((value) => value.length > 0)) rows.push(row);
+
+  return rows;
+}
+
+const createInitialForm = (): TransactionForm => ({
   title: "",
   amount: "",
-  transaction_type: "expense" as "income" | "expense",
+  transaction_type: "expense",
   category_id: "",
-  transaction_date: new Date().toISOString().slice(0, 10),
+  transaction_date: localDateString(),
   payment_method: "upi",
-  notes: ""
-};
+  notes: "",
+});
 
 export default function DashboardPage() {
   const router = useRouter();
+  const supabase = useMemo(() => getSupabase(), []);
 
   const [userEmail, setUserEmail] = useState("");
+  const [userId, setUserId] = useState("");
   const [transactions, setTransactions] = useState<Tx[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
-  const [form, setForm] = useState(initialForm);
+  const [form, setForm] = useState<TransactionForm>(createInitialForm);
   const [editing, setEditing] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
-  const [month, setMonth] = useState(new Date().toISOString().slice(0, 7));
-  const [filter, setFilter] = useState("");
+  const [month, setMonth] = useState(localMonthString());
+  const [filter, setFilter] = useState<"" | TransactionType>("");
   const [search, setSearch] = useState("");
-
-  const supabase = useMemo(() => getSupabase(), []);
 
   const load = useCallback(async () => {
     setError("");
 
-    const { data: auth } = await supabase.auth.getUser();
+    try {
+      const {
+        data: { user },
+        error: authError,
+      } = await supabase.auth.getUser();
 
-    if (!auth.user) {
-      router.replace("/login");
-      return;
+      if (authError) throw authError;
+
+      if (!user) {
+        router.replace("/login");
+        return;
+      }
+
+      setUserId(user.id);
+      setUserEmail(user.email ?? "");
+
+      const { start, end } = getMonthRange(month);
+
+      const [transactionResult, categoryResult] = await Promise.all([
+        supabase
+          .from("transactions")
+          .select(
+            "id,title,amount,transaction_type,transaction_date,payment_method,notes,category_id,categories(name)",
+          )
+          .eq("user_id", user.id)
+          .gte("transaction_date", start)
+          .lt("transaction_date", end)
+          .is("deleted_at", null)
+          .order("transaction_date", { ascending: false })
+          .order("created_at", { ascending: false }),
+        supabase
+          .from("categories")
+          .select("id,name,type")
+          .eq("is_active", true)
+          .order("name"),
+      ]);
+
+      if (transactionResult.error) throw transactionResult.error;
+      if (categoryResult.error) throw categoryResult.error;
+
+      setTransactions((transactionResult.data ?? []) as unknown as Tx[]);
+      setCategories((categoryResult.data ?? []) as Category[]);
+    } catch (cause) {
+      const message =
+        cause instanceof Error ? cause.message : "Unable to load your dashboard.";
+      setError(message);
+    } finally {
+      setLoading(false);
     }
-
-    setUserEmail(auth.user.email ?? "");
-
-    const start = `${month}-01`;
-
-    const endDate = new Date(
-      Number(month.slice(0, 4)),
-      Number(month.slice(5, 7)),
-      1
-    );
-
-    const end = endDate.toISOString().slice(0, 10);
-
-    const [
-      { data: tx, error: txErr },
-      { data: cats, error: catErr }
-    ] = await Promise.all([
-      supabase
-        .from("transactions")
-        .select(
-          "id,title,amount,transaction_type,transaction_date,payment_method,notes,category_id,categories(name)"
-        )
-        .gte("transaction_date", start)
-        .lt("transaction_date", end)
-        .is("deleted_at", null)
-        .order("transaction_date", { ascending: false })
-        .order("created_at", { ascending: false }),
-
-      supabase
-        .from("categories")
-        .select("id,name,type")
-        .eq("is_active", true)
-        .order("name")
-    ]);
-
-    if (txErr) setError(txErr.message);
-    if (catErr) setError(catErr.message);
-
-    setTransactions((tx ?? []) as unknown as Tx[]);
-    setCategories((cats ?? []) as Category[]);
-    setLoading(false);
   }, [month, router, supabase]);
 
   useEffect(() => {
-    load();
+    void load();
   }, [load]);
 
   useEffect(() => {
+    if (!userId) return;
+
     const channel = supabase
-      .channel("paisatrack-live")
+      .channel(`paisatrack-transactions-${userId}`)
       .on(
         "postgres_changes",
-        { event: "*", schema: "public", table: "transactions" },
-        () => load()
-      )
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "budgets" },
-        () => load()
+        {
+          event: "*",
+          schema: "public",
+          table: "transactions",
+          filter: `user_id=eq.${userId}`,
+        },
+        () => {
+          void load();
+        },
       )
       .subscribe();
 
     return () => {
       void supabase.removeChannel(channel);
     };
-  }, [load, supabase]);
+  }, [load, supabase, userId]);
 
   const totals = useMemo(() => {
-    const income = transactions
-      .filter((t) => t.transaction_type === "income")
-      .reduce((s, t) => s + Number(t.amount), 0);
-
-    const expenses = transactions
-      .filter((t) => t.transaction_type === "expense")
-      .reduce((s, t) => s + Number(t.amount), 0);
-
-    return {
-      income,
-      expenses,
-      net: income - expenses
-    };
+    return transactions.reduce(
+      (result, transaction) => {
+        const amount = Number(transaction.amount) || 0;
+        if (transaction.transaction_type === "income") {
+          result.income += amount;
+        } else {
+          result.expenses += amount;
+        }
+        result.net = result.income - result.expenses;
+        return result;
+      },
+      { income: 0, expenses: 0, net: 0 },
+    );
   }, [transactions]);
 
   const chartData = useMemo(() => {
     const byCategory = new Map<string, number>();
 
     transactions
-      .filter((t) => t.transaction_type === "expense")
-      .forEach((t) => {
-        const key = t.categories?.name ?? "Uncategorised";
-
-        byCategory.set(
-          key,
-          (byCategory.get(key) ?? 0) + Number(t.amount)
-        );
+      .filter((transaction) => transaction.transaction_type === "expense")
+      .forEach((transaction) => {
+        const categoryName = transaction.categories?.name ?? "Uncategorised";
+        const current = byCategory.get(categoryName) ?? 0;
+        byCategory.set(categoryName, current + Number(transaction.amount || 0));
       });
 
-    return [...byCategory.entries()]
+    return Array.from(byCategory.entries())
       .map(([category, amount]) => ({ category, amount }))
       .sort((a, b) => b.amount - a.amount)
       .slice(0, 7);
   }, [transactions]);
 
-  const visible = transactions.filter(
-    (t) =>
-      (!filter || t.transaction_type === filter) &&
-      (!search ||
-        `${t.title} ${t.categories?.name ?? ""}`
-          .toLowerCase()
-          .includes(search.toLowerCase()))
-  );
+  const visible = useMemo(() => {
+    const normalizedSearch = search.trim().toLowerCase();
 
-  async function save(e: React.FormEvent) {
-    e.preventDefault();
+    return transactions.filter((transaction) => {
+      const matchesType =
+        filter === "" || transaction.transaction_type === filter;
+      const searchableText =
+        `${transaction.title} ${transaction.categories?.name ?? ""}`.toLowerCase();
+      const matchesSearch =
+        normalizedSearch === "" || searchableText.includes(normalizedSearch);
+
+      return matchesType && matchesSearch;
+    });
+  }, [filter, search, transactions]);
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (busy) return;
 
     setBusy(true);
     setError("");
     setSuccess("");
 
-    const parsed = transactionSchema.safeParse(form);
+    try {
+      const parsed = transactionSchema.safeParse(form);
 
-    if (!parsed.success) {
-      setError(
-        parsed.error.issues[0]?.message ?? "Please check the form."
-      );
-      setBusy(false);
-      return;
-    }
+      if (!parsed.success) {
+        setError(parsed.error.issues[0]?.message ?? "Please check the form.");
+        return;
+      }
 
-    const payload = {
-      ...parsed.data,
-      amount: Number(parsed.data.amount),
-      notes: parsed.data.notes || null
-    };
+      const {
+        data: { user },
+        error: authError,
+      } = await supabase.auth.getUser();
 
-    const { data: auth } = await supabase.auth.getUser();
+      if (authError) throw authError;
+      if (!user) {
+        router.replace("/login");
+        return;
+      }
 
-    if (!auth.user) {
-      router.replace("/login");
-      setBusy(false);
-      return;
-    }
+      const payload = {
+        ...parsed.data,
+        amount: Number(parsed.data.amount),
+        notes: parsed.data.notes?.trim() || null,
+      };
 
-    const result = editing
-      ? await supabase
+      if (editing) {
+        const { error: updateError } = await supabase
           .from("transactions")
           .update(payload)
           .eq("id", editing)
-          .select("id")
-          .single()
-      : await supabase
+          .eq("user_id", user.id)
+          .is("deleted_at", null);
+
+        if (updateError) throw updateError;
+        setSuccess("Transaction updated.");
+      } else {
+        const insertPayload: TransactionInsert = {
+          ...payload,
+          user_id: user.id,
+          currency: "INR",
+          status: "posted",
+        };
+
+        const { error: insertError } = await supabase
           .from("transactions")
-          .insert({
-            ...payload,
-            user_id: auth.user.id,
-            currency: "INR",
-            status: "posted"
-          })
-          .select("id")
-          .single();
+          .insert(insertPayload);
 
-    if (result.error) {
-      setError(result.error.message);
-    } else {
-      setSuccess(
-        editing ? "Transaction updated." : "Transaction added."
-      );
+        if (insertError) throw insertError;
+        setSuccess("Transaction added.");
+      }
 
-      setForm(initialForm);
+      setForm(createInitialForm());
       setEditing(null);
-
       await load();
+    } catch (cause) {
+      setError(
+        cause instanceof Error ? cause.message : "Unable to save this transaction.",
+      );
+    } finally {
+      setBusy(false);
     }
-
-    setBusy(false);
   }
 
-  function edit(t: Tx) {
-    setEditing(t.id);
-
+  function edit(transaction: Tx) {
+    setEditing(transaction.id);
     setForm({
-      title: t.title,
-      amount: String(t.amount),
-      transaction_type: t.transaction_type,
-      category_id: t.category_id,
-      transaction_date: t.transaction_date,
-      payment_method: t.payment_method,
-      notes: t.notes ?? ""
+      title: transaction.title,
+      amount: String(transaction.amount),
+      transaction_type: transaction.transaction_type,
+      category_id: transaction.category_id,
+      transaction_date: transaction.transaction_date,
+      payment_method: transaction.payment_method,
+      notes: transaction.notes ?? "",
     });
 
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   async function remove(id: string) {
-    if (
-      !window.confirm(
-        "Delete this transaction? It will be hidden from normal views."
-      )
-    ) {
-      return;
-    }
+    const confirmed = window.confirm(
+      "Delete this transaction? It will be hidden from normal views.",
+    );
+    if (!confirmed) return;
 
-    const { error: e } = await supabase
-      .from("transactions")
-      .update({ deleted_at: new Date().toISOString() })
-      .eq("id", id);
+    setError("");
+    setSuccess("");
 
-    if (e) {
-      setError(e.message);
-    } else {
+    try {
+      const {
+        data: { user },
+        error: authError,
+      } = await supabase.auth.getUser();
+
+      if (authError) throw authError;
+      if (!user) {
+        router.replace("/login");
+        return;
+      }
+
+      const { error: deleteError } = await supabase
+        .from("transactions")
+        .update({ deleted_at: new Date().toISOString() })
+        .eq("id", id)
+        .eq("user_id", user.id)
+        .is("deleted_at", null);
+
+      if (deleteError) throw deleteError;
+
       setSuccess("Transaction deleted.");
+      if (editing === id) {
+        setEditing(null);
+        setForm(createInitialForm());
+      }
       await load();
+    } catch (cause) {
+      setError(
+        cause instanceof Error ? cause.message : "Unable to delete this transaction.",
+      );
     }
   }
 
   async function importCsv(file: File) {
+    setBusy(true);
     setError("");
     setSuccess("");
 
-    const text = await file.text();
-    const lines = text.split(/\r?\n/).filter(Boolean);
+    try {
+      const csvText = (await file.text()).replace(/^\uFEFF/, "");
+      const records = parseCsv(csvText);
 
-    if (lines.length < 2) {
-      setError(
-        "The CSV must contain a header and at least one data row."
-      );
-      return;
-    }
-
-    const headers = lines[0]
-      .split(",")
-      .map((s) => s.trim().toLowerCase());
-
-    const required = [
-      "title",
-      "amount",
-      "transaction_type",
-      "category",
-      "transaction_date",
-      "payment_method"
-    ];
-
-    const missing = required.filter((h) => !headers.includes(h));
-
-    if (missing.length) {
-      setError(`Missing CSV columns: ${missing.join(", ")}`);
-      return;
-    }
-
-    const index = (name: string) => headers.indexOf(name);
-
-    const rows: ImportedTransaction[] = [];
-    const issues: string[] = [];
-
-    const { data: auth } = await supabase.auth.getUser();
-
-    if (!auth.user) return;
-
-    for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(",").map((s) => s.trim());
-
-      const cat = categories.find(
-        (c) =>
-          c.name.toLowerCase() ===
-            cols[index("category")]?.toLowerCase() &&
-          c.type === cols[index("transaction_type")]
-      );
-
-      if (!cat) {
-        issues.push(
-          `Row ${i + 1}: category not found for this transaction type`
-        );
-        continue;
+      if (records.length < 2) {
+        throw new Error("The CSV must contain a header and at least one data row.");
       }
 
-      const parsed = transactionSchema.safeParse({
-        title: cols[index("title")],
-        amount: cols[index("amount")],
-        transaction_type: cols[index("transaction_type")],
-        category_id: cat.id,
-        transaction_date: cols[index("transaction_date")],
-        payment_method: cols[index("payment_method")],
-        notes: ""
-      });
+      const headers = records[0].map((header) => header.trim().toLowerCase());
+      const requiredHeaders = [
+        "title",
+        "amount",
+        "transaction_type",
+        "category",
+        "transaction_date",
+        "payment_method",
+      ];
+      const missingHeaders = requiredHeaders.filter(
+        (header) => !headers.includes(header),
+      );
 
-      if (!parsed.success) {
-        issues.push(
-          `Row ${i + 1}: ${parsed.error.issues[0]?.message}`
-        );
-        continue;
+      if (missingHeaders.length > 0) {
+        throw new Error(`Missing CSV columns: ${missingHeaders.join(", ")}`);
       }
 
-      rows.push({
-        title: parsed.data.title,
-        amount: Number(parsed.data.amount),
-        transaction_type: parsed.data.transaction_type,
-        category_id: parsed.data.category_id,
-        transaction_date: parsed.data.transaction_date,
-        payment_method: parsed.data.payment_method,
-        notes: parsed.data.notes ?? "",
-        user_id: auth.user.id,
-        currency: "INR",
-        status: "posted"
-      });
-    }
+      const columnIndex = (name: string) => headers.indexOf(name);
+      const issues: string[] = [];
+      const rows: TransactionInsert[] = [];
 
-    if (issues.length) {
-      setError(
-        `Import cancelled: ${issues.slice(0, 5).join(" | ")}${
-          issues.length > 5
-            ? ` | and ${issues.length - 5} more errors`
-            : ""
-        }`
-      );
-      return;
-    }
+      const {
+        data: { user },
+        error: authError,
+      } = await supabase.auth.getUser();
 
-    if (rows.length === 0) {
-      setError("No valid transactions were found in the CSV.");
-      return;
-    }
+      if (authError) throw authError;
+      if (!user) {
+        router.replace("/login");
+        return;
+      }
 
-    const { error: e } = await supabase
-      .from("transactions")
-      .insert(rows);
+      for (let rowIndex = 1; rowIndex < records.length; rowIndex += 1) {
+        const columns = records[rowIndex];
 
-    if (e) {
-      setError(e.message);
-    } else {
-      setSuccess(`${rows.length} transactions imported.`);
+        if (columns.length !== headers.length) {
+          issues.push(
+            `Row ${rowIndex + 1}: expected ${headers.length} columns but found ${columns.length}`,
+          );
+          continue;
+        }
+
+        const title = columns[columnIndex("title")] ?? "";
+        const amountText = columns[columnIndex("amount")] ?? "";
+        const rawType = (columns[columnIndex("transaction_type")] ?? "")
+          .trim()
+          .toLowerCase();
+        const categoryName = (columns[columnIndex("category")] ?? "").trim();
+        const transactionDate = columns[columnIndex("transaction_date")] ?? "";
+        const paymentMethod = (columns[columnIndex("payment_method")] ?? "")
+          .trim()
+          .toLowerCase();
+        const notesIndex = columnIndex("notes");
+        const notes = notesIndex >= 0 ? columns[notesIndex] ?? "" : "";
+
+        if (rawType !== "income" && rawType !== "expense") {
+          issues.push(`Row ${rowIndex + 1}: transaction_type must be income or expense`);
+          continue;
+        }
+
+        const transactionType: TransactionType = rawType;
+        const category = categories.find(
+          (item) =>
+            item.name.trim().toLowerCase() === categoryName.toLowerCase() &&
+            item.type === transactionType,
+        );
+
+        if (!category) {
+          issues.push(
+            `Row ${rowIndex + 1}: category "${categoryName}" was not found for ${transactionType}`,
+          );
+          continue;
+        }
+
+        if (!PAYMENT_METHODS.includes(paymentMethod as (typeof PAYMENT_METHODS)[number])) {
+          issues.push(`Row ${rowIndex + 1}: invalid payment_method "${paymentMethod}"`);
+          continue;
+        }
+
+        const parsed = transactionSchema.safeParse({
+          title,
+          amount: amountText.replace(/,/g, ""),
+          transaction_type: transactionType,
+          category_id: category.id,
+          transaction_date: transactionDate,
+          payment_method: paymentMethod,
+          notes,
+        });
+
+        if (!parsed.success) {
+          issues.push(
+            `Row ${rowIndex + 1}: ${parsed.error.issues[0]?.message ?? "invalid transaction"}`,
+          );
+          continue;
+        }
+
+        rows.push({
+          ...parsed.data,
+          amount: Number(parsed.data.amount),
+          notes: parsed.data.notes?.trim() || null,
+          user_id: user.id,
+          currency: "INR",
+          status: "posted",
+        });
+      }
+
+      if (issues.length > 0) {
+        throw new Error(
+          `Import cancelled. ${issues.slice(0, 5).join(" | ")}${
+            issues.length > 5 ? ` | and ${issues.length - 5} more errors` : ""
+          }`,
+        );
+      }
+
+      if (rows.length === 0) {
+        throw new Error("No valid transactions were found in the CSV.");
+      }
+
+      const { error: insertError } = await supabase
+        .from("transactions")
+        .insert(rows);
+
+      if (insertError) throw insertError;
+
+      setSuccess(`${rows.length} transaction${rows.length === 1 ? "" : "s"} imported.`);
       await load();
+    } catch (cause) {
+      setError(
+        cause instanceof Error ? cause.message : "Unable to import this CSV file.",
+      );
+    } finally {
+      setBusy(false);
     }
   }
 
   async function logout() {
-    await supabase.auth.signOut();
+    setError("");
+    const { error: signOutError } = await supabase.auth.signOut();
+
+    if (signOutError) {
+      setError(signOutError.message);
+      return;
+    }
+
     router.replace("/login");
   }
 
@@ -451,23 +635,18 @@ export default function DashboardPage() {
             <div className="p-2 rounded-xl bg-emerald-400/15 text-emerald-300">
               <Wallet />
             </div>
-
             <div>
               <h1 className="font-bold text-lg">PaisaTrack</h1>
-              <p className="muted text-xs">
-                Personal finance workspace
-              </p>
+              <p className="muted text-xs">Personal finance workspace</p>
             </div>
           </div>
 
           <div className="flex items-center gap-3">
-            <span className="hidden sm:block muted text-xs">
-              {userEmail}
-            </span>
-
+            <span className="hidden sm:block muted text-xs">{userEmail}</span>
             <button
+              type="button"
               className="btn btn-secondary flex items-center gap-2"
-              onClick={logout}
+              onClick={() => void logout()}
             >
               <LogOut size={16} />
               <span className="hidden sm:inline">Sign out</span>
@@ -480,24 +659,22 @@ export default function DashboardPage() {
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
             <p className="muted text-sm">Your financial overview</p>
-            <h2 className="text-2xl md:text-3xl font-bold mt-1">
-              Dashboard
-            </h2>
+            <h2 className="text-2xl md:text-3xl font-bold mt-1">Dashboard</h2>
           </div>
-
           <div className="flex gap-2 items-center">
             <input
               aria-label="Selected month"
               className="field max-w-44"
               type="month"
               value={month}
-              onChange={(e) => setMonth(e.target.value)}
+              onChange={(event) => setMonth(event.target.value || localMonthString())}
             />
-
             <button
+              type="button"
               className="btn btn-secondary"
-              onClick={load}
+              onClick={() => void load()}
               title="Refresh"
+              aria-label="Refresh dashboard"
             >
               <RefreshCw size={17} />
             </button>
@@ -529,25 +706,18 @@ export default function DashboardPage() {
             icon={<TrendingUp />}
             color="text-emerald-300"
           />
-
           <Stat
             title="Expenses"
             value={money(totals.expenses)}
             icon={<TrendingDown />}
             color="text-rose-300"
           />
-
           <Stat
             title="Net for month"
             value={money(totals.net)}
             icon={<Wallet />}
-            color={
-              totals.net >= 0
-                ? "text-emerald-300"
-                : "text-rose-300"
-            }
+            color={totals.net >= 0 ? "text-emerald-300" : "text-rose-300"}
           />
-
           <Stat
             title="Transactions"
             value={String(transactions.length)}
@@ -560,9 +730,7 @@ export default function DashboardPage() {
           <div className="panel p-5">
             <div className="flex items-center justify-between mb-5">
               <div>
-                <h3 className="font-semibold text-lg">
-                  Spending by category
-                </h3>
+                <h3 className="font-semibold text-lg">Spending by category</h3>
                 <p className="muted text-xs mt-1">
                   Selected month · top categories
                 </p>
@@ -581,32 +749,25 @@ export default function DashboardPage() {
                     layout="vertical"
                     margin={{ left: 8, right: 20 }}
                   >
-                    <CartesianGrid
-                      stroke="#263449"
-                      strokeDasharray="3 3"
-                    />
-
+                    <CartesianGrid stroke="#263449" strokeDasharray="3 3" />
                     <XAxis
                       type="number"
                       tick={{ fill: "#91a0b7", fontSize: 11 }}
                     />
-
                     <YAxis
                       type="category"
                       dataKey="category"
                       width={105}
                       tick={{ fill: "#cbd5e1", fontSize: 11 }}
                     />
-
                     <Tooltip
-                      formatter={(v) => money(Number(v))}
+                      formatter={(value) => money(Number(value))}
                       contentStyle={{
                         background: "#111827",
                         border: "1px solid #334155",
-                        borderRadius: 10
+                        borderRadius: 10,
                       }}
                     />
-
                     <Bar
                       dataKey="amount"
                       fill="#34d399"
@@ -644,13 +805,12 @@ export default function DashboardPage() {
                     setForm({
                       ...form,
                       transaction_type: "expense",
-                      category_id: ""
+                      category_id: "",
                     })
                   }
                 >
                   Expense
                 </button>
-
                 <button
                   type="button"
                   className={`btn ${
@@ -662,7 +822,7 @@ export default function DashboardPage() {
                     setForm({
                       ...form,
                       transaction_type: "income",
-                      category_id: ""
+                      category_id: "",
                     })
                   }
                 >
@@ -675,8 +835,8 @@ export default function DashboardPage() {
                 <input
                   className="field mt-1"
                   value={form.title}
-                  onChange={(e) =>
-                    setForm({ ...form, title: e.target.value })
+                  onChange={(event) =>
+                    setForm({ ...form, title: event.target.value })
                   }
                   minLength={2}
                   maxLength={60}
@@ -693,8 +853,8 @@ export default function DashboardPage() {
                   min="0.01"
                   step="0.01"
                   value={form.amount}
-                  onChange={(e) =>
-                    setForm({ ...form, amount: e.target.value })
+                  onChange={(event) =>
+                    setForm({ ...form, amount: event.target.value })
                   }
                   placeholder="0.00"
                   required
@@ -706,22 +866,17 @@ export default function DashboardPage() {
                 <select
                   className="field mt-1"
                   value={form.category_id}
-                  onChange={(e) =>
-                    setForm({
-                      ...form,
-                      category_id: e.target.value
-                    })
+                  onChange={(event) =>
+                    setForm({ ...form, category_id: event.target.value })
                   }
                   required
                 >
                   <option value="">Choose category</option>
                   {categories
-                    .filter(
-                      (c) => c.type === form.transaction_type
-                    )
-                    .map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name}
+                    .filter((category) => category.type === form.transaction_type)
+                    .map((category) => (
+                      <option key={category.id} value={category.id}>
+                        {category.name}
                       </option>
                     ))}
                 </select>
@@ -734,11 +889,8 @@ export default function DashboardPage() {
                     className="field mt-1"
                     type="date"
                     value={form.transaction_date}
-                    onChange={(e) =>
-                      setForm({
-                        ...form,
-                        transaction_date: e.target.value
-                      })
+                    onChange={(event) =>
+                      setForm({ ...form, transaction_date: event.target.value })
                     }
                     required
                   />
@@ -749,11 +901,8 @@ export default function DashboardPage() {
                   <select
                     className="field mt-1"
                     value={form.payment_method}
-                    onChange={(e) =>
-                      setForm({
-                        ...form,
-                        payment_method: e.target.value
-                      })
+                    onChange={(event) =>
+                      setForm({ ...form, payment_method: event.target.value })
                     }
                   >
                     <option value="upi">UPI</option>
@@ -774,8 +923,8 @@ export default function DashboardPage() {
                   rows={2}
                   maxLength={500}
                   value={form.notes}
-                  onChange={(e) =>
-                    setForm({ ...form, notes: e.target.value })
+                  onChange={(event) =>
+                    setForm({ ...form, notes: event.target.value })
                   }
                 />
               </label>
@@ -784,6 +933,7 @@ export default function DashboardPage() {
                 <button
                   disabled={busy}
                   className="btn btn-primary flex-1 disabled:opacity-50"
+                  type="submit"
                 >
                   {busy
                     ? "Saving…"
@@ -798,7 +948,7 @@ export default function DashboardPage() {
                     className="btn btn-secondary"
                     onClick={() => {
                       setEditing(null);
-                      setForm(initialForm);
+                      setForm(createInitialForm());
                     }}
                   >
                     Cancel
@@ -818,17 +968,22 @@ export default function DashboardPage() {
               </p>
             </div>
 
-            <label className="btn btn-secondary flex items-center gap-2 cursor-pointer">
+            <label
+              className={`btn btn-secondary flex items-center gap-2 ${
+                busy ? "opacity-50 pointer-events-none" : "cursor-pointer"
+              }`}
+            >
               <Upload size={16} />
               Import CSV
               <input
                 className="hidden"
                 type="file"
                 accept=".csv,text/csv"
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) void importCsv(f);
-                  e.currentTarget.value = "";
+                disabled={busy}
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) void importCsv(file);
+                  event.currentTarget.value = "";
                 }}
               />
             </label>
@@ -839,13 +994,14 @@ export default function DashboardPage() {
               className="field"
               placeholder="Search title or category…"
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              onChange={(event) => setSearch(event.target.value)}
             />
-
             <select
               className="field sm:max-w-48"
               value={filter}
-              onChange={(e) => setFilter(e.target.value)}
+              onChange={(event) =>
+                setFilter(event.target.value as "" | TransactionType)
+              }
             >
               <option value="">All types</option>
               <option value="expense">Expenses</option>
@@ -867,50 +1023,47 @@ export default function DashboardPage() {
               </thead>
 
               <tbody>
-                {visible.map((t) => (
+                {visible.map((transaction) => (
                   <tr
-                    key={t.id}
+                    key={transaction.id}
                     className="border-b border-slate-800/80"
                   >
                     <td className="py-3 font-medium">
-                      {t.title}
+                      {transaction.title}
                       <div className="muted text-xs">
-                        {t.notes ?? ""}
+                        {transaction.notes ?? ""}
                       </div>
                     </td>
-
-                    <td>{dateLabel(t.transaction_date)}</td>
-                    <td>{t.categories?.name ?? "—"}</td>
-
+                    <td>{dateLabel(transaction.transaction_date)}</td>
+                    <td>{transaction.categories?.name ?? "—"}</td>
                     <td className="capitalize">
-                      {t.payment_method.replaceAll("_", " ")}
+                      {transaction.payment_method.replaceAll("_", " ")}
                     </td>
-
                     <td
                       className={`text-right font-semibold ${
-                        t.transaction_type === "income"
+                        transaction.transaction_type === "income"
                           ? "text-emerald-300"
                           : "text-slate-100"
                       }`}
                     >
-                      {t.transaction_type === "income" ? "+" : "−"}
-                      {money(t.amount)}
+                      {transaction.transaction_type === "income" ? "+" : "−"}
+                      {money(transaction.amount)}
                     </td>
-
                     <td>
                       <div className="flex justify-end gap-2">
                         <button
+                          type="button"
                           className="p-2 rounded-lg hover:bg-slate-700"
                           aria-label="Edit transaction"
-                          onClick={() => edit(t)}
+                          onClick={() => edit(transaction)}
                         >
                           <Pencil size={15} />
                         </button>
-
                         <button
+                          type="button"
                           className="p-2 rounded-lg hover:bg-red-950 text-rose-300"
                           aria-label="Delete transaction"
-                          onClick={() => void remove(t.id)}
+                          onClick={() => void remove(transaction.id)}
                         >
                           <Trash2 size={15} />
                         </button>
@@ -941,11 +1094,11 @@ function Stat({
   title,
   value,
   icon,
-  color
+  color,
 }: {
   title: string;
   value: string;
-  icon: React.ReactNode;
+  icon: ReactNode;
   color: string;
 }) {
   return (
@@ -954,10 +1107,7 @@ function Stat({
         <span>{title}</span>
         <span className={color}>{icon}</span>
       </div>
-
-      <p className="text-2xl font-bold mt-3 tracking-tight">
-        {value}
-      </p>
+      <p className="text-2xl font-bold mt-3 tracking-tight">{value}</p>
     </div>
   );
 }
